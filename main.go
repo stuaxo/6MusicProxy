@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -47,7 +48,16 @@ var buffers = make(map[string][]byte)
 var (
 	once      sync.Once
 	netClient *http.Client
+	idleSleepDuration time.Duration
 )
+
+var activeConnections int32
+var lastActivityTime atomic.Value
+
+func init() {
+	lastActivityTime.Store(time.Now())
+}
+
 
 // Create a single client connection, use keepalive to hold open
 // and reduce handshake times...
@@ -290,8 +300,27 @@ func indexHandler(w http.ResponseWriter, req *http.Request) {
 	fmt.Fprintf(w, "nothing to see here...")
 }
 
+func updateLastActivity() {
+	lastActivityTime.Store(time.Now())
+}
+
+func timeSinceLastActivity() time.Duration {
+	last := lastActivityTime.Load().(time.Time)
+	return time.Since(last)
+}
+
 func fileHandler(w http.ResponseWriter, req *http.Request) {
 	start := time.Now()
+	atomic.AddInt32(&activeConnections, 1)
+	updateLastActivity()
+	log.Printf("Connection opened. Active connections: %d", atomic.LoadInt32(&activeConnections))
+	
+	defer func() {
+		updateLastActivity()
+		atomic.AddInt32(&activeConnections, -1)
+		log.Printf("Connection closed. Active connections: %d", atomic.LoadInt32(&activeConnections))
+	}()
+
 	w.Header().Set("X-Powered-By", "Golang!")
 	path := filepath.Base(req.URL.Path)
 	//log.Printf("REQ for %v", path)
@@ -314,80 +343,118 @@ func fileHandler(w http.ResponseWriter, req *http.Request) {
 }
 
 func main() {
-	daemonFlag := flag.Bool("d", false, "Run as a daemon")
-	flag.Parse()
+    daemonFlag := flag.Bool("d", false, "Run as a daemon")
+	flag.DurationVar(&idleSleepDuration, "i", 2*time.Minute, "Duration to continue fetching after last activity (0 for never sleep)")
+    flag.Parse()
 
-	var cntxt *daemon.Context
-	if *daemonFlag {
-		cntxt = &daemon.Context{
-			PidFileName: "/var/run/6music.pid",
-			PidFilePerm: 0644,
-			LogFileName: "/var/log/6music.log",
-			LogFilePerm: 0644,
-			WorkDir:     "/var/empty/",
-			Umask:       022,
-		}
 
-		d, err := cntxt.Reborn()
-		if err != nil {
-			log.Fatal("Unable to run: ", err)
-		}
-		if d != nil {
-			return
-		}
-		defer cntxt.Release()
+	if idleSleepDuration < 0 {
+		log.Fatal("Idle sleep duration must be non-negative")
 	}
 
-	starttime = time.Now()
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	if !strings.HasPrefix(sourceurl, "http") {
-		log.Fatal("cms17> " + "Playlist URL must begin with http/https")
-	}
+    var cntxt *daemon.Context
+    if *daemonFlag {
+        cntxt = &daemon.Context{
+            PidFileName: "/var/run/6music.pid",
+            PidFilePerm: 0644,
+            LogFileName: "/var/log/6music.log",
+            LogFilePerm: 0644,
+            WorkDir:     "/var/empty/",
+            Umask:       022,
+        }
 
-	target, err := url.Parse(sourceurl)
-	if err != nil {
-		log.Fatal("cms18> " + err.Error())
-	}
+        d, err := cntxt.Reborn()
+        if err != nil {
+            log.Fatal("Unable to run: ", err)
+        }
+        if d != nil {
+            return
+        }
+        defer cntxt.Release()
+    }
 
-	if _, err := os.Stat(statefile); os.IsNotExist(err) {
-		err := os.WriteFile(statefile, []byte("1"), 0644)
-		if err != nil {
-			log.Printf("FATAL: Could not create statefile %v (%v)", statefile, err)
-			log.Printf("INFO: Please ensure file exists and has the correct owner, or the user running this has permissions to write to the file/directory.")
-		}
-		ourseqnumber = 1
-	} else {
-		oldstate, err := ioutil.ReadFile(statefile)
-		if err != nil {
+    starttime = time.Now()
+    log.SetFlags(log.LstdFlags | log.Lshortfile)
+    if !strings.HasPrefix(sourceurl, "http") {
+        log.Fatal("cms17> Playlist URL must begin with http/https")
+    }
+
+    target, err := url.Parse(sourceurl)
+    if err != nil {
+        log.Fatal("cms18> " + err.Error())
+    }
+
+    if _, err := os.Stat(statefile); os.IsNotExist(err) {
+        err := os.WriteFile(statefile, []byte("1"), 0644)
+        if err != nil {
+            log.Printf("FATAL: Could not create statefile %v (%v)", statefile, err)
+            log.Printf("INFO: Please ensure file exists and has the correct owner, or the user running this has permissions to write to the file/directory.")
+        }
+        ourseqnumber = 1
+    } else {
+        oldstate, err := ioutil.ReadFile(statefile)
+        if err != nil {
 			log.Printf("ERROR:  State file %v exists, but cannot open (%v)", statefile, err)
-		}
-		ourseqnumber, err = strconv.Atoi(string(oldstate))
-		if err != nil {
+        }
+        ourseqnumber, err = strconv.Atoi(string(oldstate))
+        if err != nil {
 			log.Printf("ERROR:  %v", err)
-		}
-	}
-	timer := time.NewTicker(5000 * time.Millisecond)
+        }
+    }
+
+    fetching := false
+	fetchTicker := time.NewTicker(5 * time.Second)
+	defer fetchTicker.Stop()
+
 	go func() {
-		for _ = range timer.C {
-			getPlaylist(target)
+		for range fetchTicker.C {
+			connections := atomic.LoadInt32(&activeConnections)
+			if connections < 0 {
+				log.Printf("WARNING: Active connections count is negative (%d). Resetting to 0.", connections)
+				atomic.StoreInt32(&activeConnections, 0)
+				connections = 0
+			}
+
+			timeSinceActivity := timeSinceLastActivity()
+			log.Printf("Checking connections. Active: %d, Time since last activity: %v, Fetching: %v", connections, timeSinceActivity, fetching)
+			
+			if connections > 0 || (idleSleepDuration == 0) || (idleSleepDuration > 0 && timeSinceActivity < idleSleepDuration) {
+				if !fetching {
+					log.Println("Active connection or recent activity detected, starting to fetch the stream.")
+					fetching = true
+				}
+				log.Println("Fetching playlist...")
+				if err := getPlaylist(target); err != nil {
+					log.Printf("Error fetching playlist: %v", err)
+				} else {
+					log.Println("Playlist fetched successfully.")
+				}
+
+				if (connections > 0 || (idleSleepDuration == 0)) {
+					updateLastActivity()
+				}
+			} else if fetching {
+				log.Println("No active connections and no recent activity, stopping stream fetching.")
+				fetching = false
+			}
 		}
 	}()
 
-	// debugging
-	go func() {
-		log.Println(http.ListenAndServe("localhost:6060", nil))
-	}()
+    go func() {
+        log.Println(http.ListenAndServe("localhost:6060", nil))
+    }()
 
-	r := mux.NewRouter()
-	r.HandleFunc("/6MusicProxy/", indexHandler)
-	r.HandleFunc("/6MusicProxy/{filename}", fileHandler)
+    r := mux.NewRouter()
+    r.HandleFunc("/6MusicProxy/", indexHandler)
+    r.HandleFunc("/6MusicProxy/{filename}", fileHandler)
 
-	srv := &http.Server{
-		Handler:      r,
-		Addr:         ":" + port,
-		WriteTimeout: 15 * time.Second,
-		ReadTimeout:  15 * time.Second,
-	}
-	srv.SetKeepAlivesEnabled(true)
-	log.Fatal(srv.ListenAndServe())
+    srv := &http.Server{
+        Handler:      r,
+        Addr:         ":" + port,
+        WriteTimeout: 15 * time.Second,
+        ReadTimeout:  15 * time.Second,
+    }
+    srv.SetKeepAlivesEnabled(true)
+	log.Printf("Server starting on port %s", port)
+    log.Fatal(srv.ListenAndServe())
 }

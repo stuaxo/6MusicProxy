@@ -1,0 +1,13 @@
+services:
+  6musicproxy:
+    build: .
+    container_name: 6musicproxy
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/London
+    ports:
+      - 8888:8888
+    volumes:
+      - ./config:/config
+    restart: unless-stopped
